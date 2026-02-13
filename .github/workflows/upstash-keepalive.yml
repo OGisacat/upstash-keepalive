@@ -2,15 +2,15 @@ name: Upstash Keep Alive
 
 on:
   schedule:
-    
-    - cron: "17 0 */3 * *"
+    # 每天 UTC 00:17 运行一次，降低被判定为长期不活跃的概率
+    - cron: "17 0 * * *"
   workflow_dispatch: {}
 
 jobs:
-  ping:
+  keepalive:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Upstash Redis
+      - name: Keep Upstash Redis active (read-only)
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
@@ -22,11 +22,28 @@ jobs:
             exit 1
           fi
 
-          echo "Pinging Upstash..."
-          # Upstash Redis REST：POST /ping
-          resp=$(curl -sS -X POST "${UPSTASH_REDIS_REST_URL}/ping" \
-            -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}")
+          auth_header="Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}"
 
-          echo "Response: $resp"
-          # 预期包含：PONG
-          echo "$resp" | grep -q "PONG"
+          echo "Sending PING..."
+          ping_resp=$(curl -fsS -X POST "${UPSTASH_REDIS_REST_URL}/ping" \
+            -H "$auth_header")
+          echo "PING response: $ping_resp"
+          echo "$ping_resp" | grep -q 'PONG'
+
+          # 两个只读操作里随机执行一个：DBSIZE 或 TIME
+          if [ $((RANDOM % 2)) -eq 0 ]; then
+            echo "Selected read op: DBSIZE"
+            read_resp=$(curl -fsS -X POST "${UPSTASH_REDIS_REST_URL}/dbsize" \
+              -H "$auth_header")
+            echo "DBSIZE response: $read_resp"
+            echo "$read_resp" | grep -Eq '"result"\s*:\s*[0-9]+'
+          else
+            echo "Selected read op: TIME"
+            read_resp=$(curl -fsS -X POST "${UPSTASH_REDIS_REST_URL}/time" \
+              -H "$auth_header")
+            echo "TIME response: $read_resp"
+            # TIME 预期为数组结果，例如 {"result":["1710000000","123456"]}
+            echo "$read_resp" | grep -Eq '"result"\s*:\s*\['
+          fi
+
+          echo "Read-only keepalive succeeded."

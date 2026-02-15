@@ -2,7 +2,7 @@ name: Upstash Keep Alive
 
 on:
   schedule:
-    # 每天 UTC 00:17 运行一次，降低被判定为长期不活跃的概率
+    # 每天 UTC 00:17 运行，降低被判定为长期不活跃的概率
     - cron: "17 0 * * *"
   workflow_dispatch: {}
 
@@ -15,35 +15,138 @@ jobs:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+
+          # ── 工具函数 ──────────────────────────────────────
+
+          ts() { date -u '+%Y-%m-%d %H:%M:%S UTC'; }
+
+          # 带重试的 curl 封装，最多 3 次，间隔 5 秒
+          redis_call() {
+            local cmd="$1"
+            local attempt=1
+            local max_attempts=3
+            local resp=""
+            while [ $attempt -le $max_attempts ]; do
+              resp=$(curl -fsS --max-time 15 -X POST \
+                "${UPSTASH_REDIS_REST_URL}/${cmd}" \
+                -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" 2>&1) && break
+              echo "  [$(ts)] Attempt $attempt/$max_attempts failed for ${cmd}, retrying in 5s..."
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+            if [ $attempt -gt $max_attempts ]; then
+              echo "  [$(ts)] ERROR: ${cmd} failed after $max_attempts attempts"
+              return 1
+            fi
+            echo "$resp"
+            return 0
+          }
+
+          # ── 检查 secrets ─────────────────────────────────
 
           if [ -z "${UPSTASH_REDIS_REST_URL:-}" ] || [ -z "${UPSTASH_REDIS_REST_TOKEN:-}" ]; then
             echo "Missing secrets UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN"
             exit 1
           fi
 
-          auth_header="Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}"
+          echo "============================================"
+          echo "  Upstash Keep-Alive  ·  $(ts)"
+          echo "============================================"
+          echo ""
 
-          echo "Sending PING..."
-          ping_resp=$(curl -fsS -X POST "${UPSTASH_REDIS_REST_URL}/ping" \
-            -H "$auth_header")
-          echo "PING response: $ping_resp"
+          # ── 随机延迟 0-180 秒，让每天执行时间不完全一样 ──
+          delay=$((RANDOM % 181))
+          echo "[$(ts)] Random startup delay: ${delay}s"
+          sleep "$delay"
+          echo "[$(ts)] Delay complete, starting read operations..."
+          echo ""
+
+          # ── PING（始终执行）────────────────────────────────
+
+          echo "── PING ──"
+          ping_resp=$(redis_call "ping") || { echo "PING failed, aborting."; exit 1; }
+          echo "  Response: $ping_resp"
           echo "$ping_resp" | grep -q 'PONG'
+          echo "  Status: OK"
+          echo ""
 
-          # 两个只读操作里随机执行一个：DBSIZE 或 TIME
-          if [ $((RANDOM % 2)) -eq 0 ]; then
-            echo "Selected read op: DBSIZE"
-            read_resp=$(curl -fsS -X POST "${UPSTASH_REDIS_REST_URL}/dbsize" \
-              -H "$auth_header")
-            echo "DBSIZE response: $read_resp"
-            echo "$read_resp" | grep -Eq '"result"\s*:\s*[0-9]+'
+          # ── 三组只读操作，随机选一组 ────────────────────────
+          #
+          #  Group A: 数据库概览 — DBSIZE / TIME / RANDOMKEY / INFO keyspace
+          #  Group B: 服务器状态 — TIME / INFO server / INFO stats / DBSIZE
+          #  Group C: 内存与连接 — INFO memory / INFO clients / RANDOMKEY / TIME
+          #
+          # 每组执行 4 个读命令，加上前面的 PING 共 5 个，后台日志更明显。
+
+          group=$((RANDOM % 3))
+          failed=0
+
+          run_op() {
+            local label="$1"
+            local cmd="$2"
+            local validate_pattern="$3"
+            echo "── ${label} ──"
+            local resp
+            resp=$(redis_call "$cmd")
+            local rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "  Status: FAILED"
+              failed=$((failed + 1))
+              return
+            fi
+            echo "  Response: $resp"
+            if [ -n "$validate_pattern" ]; then
+              if echo "$resp" | grep -Eq "$validate_pattern"; then
+                echo "  Status: OK"
+              else
+                echo "  Status: WARN (unexpected format)"
+                failed=$((failed + 1))
+              fi
+            else
+              echo "  Status: OK (no validation)"
+            fi
+            echo ""
+          }
+
+          case $group in
+            0)
+              echo ">>> Selected Group A: Database Overview"
+              echo ""
+              run_op "DBSIZE"     "dbsize"              '"result"\s*:\s*[0-9]+'
+              run_op "TIME"       "time"                '"result"\s*:\s*\['
+              run_op "RANDOMKEY"  "randomkey"           '"result"'
+              run_op "INFO keyspace" "info/keyspace"    '"result"'
+              ;;
+            1)
+              echo ">>> Selected Group B: Server Status"
+              echo ""
+              run_op "TIME"       "time"                '"result"\s*:\s*\['
+              run_op "INFO server"  "info/server"       '"result"'
+              run_op "INFO stats"   "info/stats"        '"result"'
+              run_op "DBSIZE"     "dbsize"              '"result"\s*:\s*[0-9]+'
+              ;;
+            2)
+              echo ">>> Selected Group C: Memory & Clients"
+              echo ""
+              run_op "INFO memory"  "info/memory"       '"result"'
+              run_op "INFO clients" "info/clients"      '"result"'
+              run_op "RANDOMKEY"  "randomkey"           '"result"'
+              run_op "TIME"       "time"                '"result"\s*:\s*\['
+              ;;
+          esac
+
+          # ── 结果汇总 ───────────────────────────────────────
+
+          echo "============================================"
+          if [ $failed -eq 0 ]; then
+            echo "  All read operations succeeded."
           else
-            echo "Selected read op: TIME"
-            read_resp=$(curl -fsS -X POST "${UPSTASH_REDIS_REST_URL}/time" \
-              -H "$auth_header")
-            echo "TIME response: $read_resp"
-            # TIME 预期为数组结果，例如 {"result":["1710000000","123456"]}
-            echo "$read_resp" | grep -Eq '"result"\s*:\s*\['
+            echo "  WARNING: $failed operation(s) returned unexpected results."
+            echo "  (Non-fatal — keepalive traffic was still generated.)"
           fi
+          echo "  Finished at $(ts)"
+          echo "============================================"
 
-          echo "Read-only keepalive succeeded."
+          # 只要 PING 成功就算 keepalive 达成，读操作异常不阻塞流程
+          exit 0
